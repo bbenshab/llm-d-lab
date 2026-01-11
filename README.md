@@ -187,6 +187,61 @@ oc get csv -n <namespace>
 
 ---
 
+## 🧹 Cluster Cleanup
+
+Before redeploying or when you need to start fresh, use the automated cleanup job to remove all operator resources.
+
+### Quick Cleanup
+
+```bash
+# Apply the cleanup Job directly
+oc apply -k manifests/00-cleanup
+
+# Watch the cleanup process
+oc logs -n openshift-operators job/cleanup-operators -f
+
+# Wait for completion (auto-deletes after 5 minutes)
+oc wait --for=condition=complete job/cleanup-operators -n openshift-operators --timeout=600s
+```
+
+### What Gets Cleaned Up
+
+The cleanup job removes:
+- **Operators:** GPU Operator, NVIDIA Network Operator, NFD, SR-IOV, GitOps
+- **CSVs:** From ALL namespaces (solves the 91-namespace CSV issue)
+- **Resources:** Subscriptions, InstallPlans, ClusterPolicies, NicClusterPolicies
+- **Namespaces:** nvidia-gpu-operator, nvidia-network-operator, openshift-nfd, openshift-sriov-network-operator, openshift-gitops
+- **CRDs:** All operator-related custom resource definitions
+- **RBAC:** ClusterRoles and ClusterRoleBindings
+
+### Verify Cleanup
+
+```bash
+# Check no operator CSVs remain
+oc get csv -A | grep -E "(gitops|gpu|nvidia|nfd|sriov)" || echo "Clean ✓"
+
+# Check no operator namespaces remain
+oc get ns | grep -E "(nvidia|nfd|sriov|gitops)" || echo "Clean ✓"
+
+# Check no operator CRDs remain
+oc get crd | grep -E "(nvidia|mellanox|nfd|sriov|argoproj)" || echo "Clean ✓"
+```
+
+### Via ArgoCD (Alternative Method)
+
+1. Edit `envs/baremetal-lab/kustomization.yaml`
+2. Uncomment the cleanup resource:
+   ```yaml
+   resources:
+     - ../../manifests/00-cleanup  # <-- Uncomment this line
+   ```
+3. Sync via ArgoCD: `argocd app sync root-app`
+4. Wait for completion, then re-comment before deploying the stack
+
+**Note:** The cleanup job is safe to run multiple times (idempotent) and auto-deletes after 5 minutes. See [manifests/00-cleanup/README.md](manifests/00-cleanup/README.md) for details.
+
+---
+
 ## 🏃 Running Example Workloads
 
 The `examples/` directory contains sample manifests and Helm charts intended for deploying LLM-D workloads.
