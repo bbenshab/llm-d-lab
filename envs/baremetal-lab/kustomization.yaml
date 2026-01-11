@@ -1,0 +1,19 @@
+kind: Kustomization
+apiVersion: kustomize.config.k8s.io/v1beta1
+namespace: openshift-gitops
+resources:
+  - namespace.yaml
+  # Core infrastructure
+  - ../../apps/00-node-preparation
+  - ../../apps/20-operators-baremetal
+  - ../../apps/15-nfd
+  - ../../apps/27-gitops
+  # RDMA/RoCE stack
+  - ../../apps/30-sriov-operator
+  - ../../apps/28-nvidia-network-operator
+  - ../../apps/29-nvidia-mofed-ready
+  - ../../apps/35-roce-discovery
+  # GPU stack
+  - ../../apps/30-gpu-operator-nfd
+  # Monitoring (optional)
+  - ../../apps/30-grafana

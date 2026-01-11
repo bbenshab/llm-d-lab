@@ -1,0 +1,226 @@
+---
+# Cleanup Job - Run BEFORE fresh deployment to remove all operator resources
+# This prevents CSV/CRD conflicts from previous installations
+#
+# Usage: Uncomment this resource in envs/baremetal-lab/kustomization.yaml and sync
+#
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: operator-cleanup
+  namespace: openshift-operators
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: operator-cleanup
+rules:
+- apiGroups: [""]
+  resources: ["namespaces", "pods"]
+  verbs: ["get", "list", "delete", "patch"]
+- apiGroups: ["operators.coreos.com"]
+  resources: ["subscriptions", "clusterserviceversions", "installplans"]
+  verbs: ["get", "list", "delete", "patch"]
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["apiextensions.k8s.io"]
+  resources: ["customresourcedefinitions"]
+  verbs: ["get", "list", "delete", "patch"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["mutatingwebhookconfigurations", "validatingwebhookconfigurations"]
+  verbs: ["get", "list", "delete"]
+- apiGroups: ["nvidia.com"]
+  resources: ["clusterpolicies"]
+  verbs: ["get", "list", "delete", "patch"]
+- apiGroups: ["mellanox.com"]
+  resources: ["nicclusterpolicies"]
+  verbs: ["get", "list", "delete", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: operator-cleanup
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: operator-cleanup
+subjects:
+- kind: ServiceAccount
+  name: operator-cleanup
+  namespace: openshift-operators
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cleanup-operators
+  namespace: openshift-operators
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      serviceAccountName: operator-cleanup
+      restartPolicy: Never
+      containers:
+      - name: cleanup
+        image: registry.redhat.io/openshift4/ose-cli:latest
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+
+          echo "========================================"
+          echo "Comprehensive Operator Cleanup"
+          echo "========================================"
+          echo ""
+
+          # Function to delete all CSVs for a given operator
+          cleanup_operator_csvs() {
+            local operator_name=$1
+            echo "Cleaning up $operator_name CSVs across all namespaces..."
+
+            # Get all namespaces with this CSV
+            namespaces=$(oc get csv -A | grep "$operator_name" | awk '{print $1}' | sort -u)
+
+            if [ -z "$namespaces" ]; then
+              echo "  No CSVs found for $operator_name"
+              return
+            fi
+
+            count=0
+            for ns in $namespaces; do
+              csv_names=$(oc get csv -n $ns | grep "$operator_name" | awk '{print $1}')
+              for csv in $csv_names; do
+                oc patch csv $csv -n $ns -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+                oc delete csv $csv -n $ns --wait=false --ignore-not-found=true 2>/dev/null || true
+                count=$((count + 1))
+              done
+            done
+
+            echo "  Cleaned up $count CSV(s) for $operator_name"
+          }
+
+          # 1. Delete ArgoCD/GitOps Operator
+          echo "[1/7] Removing ArgoCD/GitOps Operator..."
+          oc delete subscription openshift-gitops-operator -n openshift-operators --ignore-not-found=true 2>/dev/null || true
+          oc delete deployment openshift-gitops-operator-controller-manager -n openshift-operators --ignore-not-found=true 2>/dev/null || true
+          cleanup_operator_csvs "openshift-gitops-operator"
+
+          # 2. Delete GPU Operator
+          echo "[2/7] Removing GPU Operator..."
+          oc delete subscription gpu-operator-certified -n nvidia-gpu-operator --ignore-not-found=true 2>/dev/null || true
+          oc delete clusterpolicy --all --ignore-not-found=true 2>/dev/null || true
+          cleanup_operator_csvs "gpu-operator-certified"
+
+          # 3. Delete Network Operator
+          echo "[3/7] Removing Network Operator..."
+          oc delete subscription nvidia-network-operator -n nvidia-network-operator --ignore-not-found=true 2>/dev/null || true
+          oc delete nicclusterpolicy --all --ignore-not-found=true 2>/dev/null || true
+          cleanup_operator_csvs "nvidia-network-operator"
+
+          # 4. Delete NFD Operator
+          echo "[4/7] Removing NFD Operator..."
+          oc delete subscription nfd -n openshift-nfd --ignore-not-found=true 2>/dev/null || true
+          cleanup_operator_csvs "nfd"
+
+          # 5. Delete SR-IOV Operator
+          echo "[5/7] Removing SR-IOV Operator..."
+          oc delete subscription sriov-network-operator-subscription -n openshift-sriov-network-operator --ignore-not-found=true 2>/dev/null || true
+          # Delete SR-IOV custom resources to prevent stuck state in next deployment
+          echo "  Removing SR-IOV custom resources..."
+          oc patch sriovoperatorconfig default -n openshift-sriov-network-operator -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+          oc delete sriovoperatorconfig,sriovnetwork,sriovnetworknodepolicy --all -n openshift-sriov-network-operator --ignore-not-found=true --timeout=30s 2>/dev/null || true
+          cleanup_operator_csvs "sriov-network-operator"
+
+          # 6. Delete operator namespaces
+          echo "[6/7] Removing operator namespaces..."
+          for ns in nvidia-gpu-operator nvidia-network-operator openshift-nfd openshift-sriov-network-operator openshift-gitops; do
+            echo "  Patching namespace $ns to remove finalizers..."
+            oc patch namespace $ns -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null || true
+            echo "  Deleting namespace $ns..."
+            oc delete namespace $ns --ignore-not-found=true --timeout=30s 2>/dev/null || true
+          done
+
+          # Wait a bit for namespaces to start deleting
+          sleep 10
+
+          # 7. Delete operator CRDs and webhooks
+          echo "[7/10] Removing operator CRDs and webhooks..."
+          # Delete CRDs with timeout to prevent hanging
+          echo "  Deleting operator CRDs (with 60s timeout)..."
+          timeout 60 bash -c 'oc get crd | grep -E "(nfd|sriov|nvidia|mellanox|argoproj)" | awk "{print \$1}" | xargs -r oc delete crd --ignore-not-found=true --wait=false 2>/dev/null || true' || echo "  CRD deletion timed out (this is OK)"
+
+          echo "  Deleting webhook configurations..."
+          oc get mutatingwebhookconfigurations,validatingwebhookconfigurations 2>/dev/null | grep -E "(nfd|sriov|nvidia)" | awk '{print $1}' | xargs -r oc delete --ignore-not-found=true 2>/dev/null || true
+
+          # 8. Delete operator InstallPlans
+          echo "[8/10] Removing operator InstallPlans..."
+          oc get installplan -A 2>/dev/null | grep -E "(gitops|gpu|nvidia|nfd|sriov)" | awk '{print $2 " -n " $1}' | xargs -r -I {} sh -c 'oc delete installplan {} --ignore-not-found=true 2>/dev/null || true'
+          echo "  InstallPlans cleaned up"
+
+          # 9. Delete operator ClusterRoles
+          echo "[9/10] Removing operator ClusterRoles..."
+          # GitOps ClusterRoles
+          oc delete clusterrole \
+            gitops-service-cluster \
+            gitopsservices.pipelines.openshift.io-v1alpha1-admin \
+            gitopsservices.pipelines.openshift.io-v1alpha1-crdview \
+            gitopsservices.pipelines.openshift.io-v1alpha1-edit \
+            gitopsservices.pipelines.openshift.io-v1alpha1-view \
+            --ignore-not-found=true 2>/dev/null || true
+          oc get clusterrole 2>/dev/null | grep "openshift-gitops-" | awk '{print $1}' | xargs -r oc delete clusterrole --ignore-not-found=true 2>/dev/null || true
+
+          # NFD ClusterRoles
+          oc delete clusterrole \
+            nfd-gc nfd-master nfd-metrics-reader nfd-prune nfd-topology-updater \
+            --ignore-not-found=true 2>/dev/null || true
+
+          # SR-IOV ClusterRoles (with generated hash suffixes)
+          oc get clusterrole 2>/dev/null | grep "sriov-network-operator.v-" | awk '{print $1}' | xargs -r oc delete clusterrole --ignore-not-found=true 2>/dev/null || true
+
+          echo "  ClusterRoles cleaned up"
+
+          # 10. Delete operator ClusterRoleBindings
+          echo "[10/10] Removing operator ClusterRoleBindings..."
+          # GitOps ClusterRoleBindings
+          oc delete clusterrolebinding \
+            gitops-application-controller-cluster-admin \
+            gitops-service-cluster \
+            --ignore-not-found=true 2>/dev/null || true
+          oc get clusterrolebinding 2>/dev/null | grep "openshift-gitops-" | awk '{print $1}' | xargs -r oc delete clusterrolebinding --ignore-not-found=true 2>/dev/null || true
+
+          # NFD ClusterRoleBindings
+          oc delete clusterrolebinding \
+            nfd-gc nfd-master nfd-prune nfd-topology-updater \
+            --ignore-not-found=true 2>/dev/null || true
+
+          # SR-IOV ClusterRoleBindings (with generated hash suffixes)
+          oc get clusterrolebinding 2>/dev/null | grep "sriov-network-operator.v-" | awk '{print $1}' | xargs -r oc delete clusterrolebinding --ignore-not-found=true 2>/dev/null || true
+
+          echo "  ClusterRoleBindings cleaned up"
+
+          echo ""
+          echo "========================================"
+          echo "Cleanup Complete!"
+          echo "========================================"
+          echo ""
+          echo "Verifying cleanup..."
+          echo ""
+          echo "Remaining operator CSVs:"
+          oc get csv -A | grep -E "(openshift-gitops-operator|gpu-operator|nvidia-network-operator|nfd|sriov)" || echo "  None ✓"
+          echo ""
+          echo "Remaining operator namespaces:"
+          oc get ns | grep -E "(nvidia-gpu-operator|nvidia-network-operator|openshift-nfd|openshift-sriov|openshift-gitops)" || echo "  None ✓"
+          echo ""
+          echo "Remaining operator InstallPlans:"
+          oc get installplan -A | grep -E "(gitops|gpu|nvidia|nfd|sriov)" || echo "  None ✓"
+          echo ""
+          echo "Remaining operator ClusterRoles:"
+          oc get clusterrole | grep -E "(gitops|nfd|sriov)" || echo "  None ✓"
+          echo ""
+          echo "Remaining operator ClusterRoleBindings:"
+          oc get clusterrolebinding | grep -E "(gitops|nfd|sriov)" || echo "  None ✓"
+          echo ""
+          echo "Cluster is ready for fresh deployment"

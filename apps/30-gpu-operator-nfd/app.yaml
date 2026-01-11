@@ -2,8 +2,13 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: gpu-operator-nfd
+  namespace: openshift-gitops
   labels:
     app.kubernetes.io/managed-by: llm-d-lab
+  annotations:
+    argocd.argoproj.io/sync-wave: "4"
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
   destination:
     name: ''
@@ -11,7 +16,7 @@ spec:
     server: 'https://kubernetes.default.svc'
   source:
     path: manifests/30-gpu-operator-nfd
-    repoURL: https://github.com/aleskandro/llm-d-lab.git
+    repoURL: https://github.com/bbenshab/llm-d-lab.git
     targetRevision: master
   sources: []
   project: default

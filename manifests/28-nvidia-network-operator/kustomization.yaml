@@ -1,0 +1,6 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nvidia-network-operator
+resources:
+  # Dynamic version discovery - PreSync hook creates NicClusterPolicy with operator default version
+  - 00-version-discovery-job.yaml

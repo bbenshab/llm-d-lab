@@ -9,3 +9,5 @@ spec:
   enableInjector: true
   enableOperatorWebhook: true
   logLevel: 2
+  # Note: maxUnavailable is not supported in SR-IOV operator v1.x
+  # By default, nodes are updated one at a time (serial updates)

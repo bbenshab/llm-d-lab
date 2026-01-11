@@ -1,0 +1,90 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: label-worker-nodes-for-sriov
+  namespace: openshift-sriov-network-operator
+  labels:
+    app: sriov-worker-labeler
+  annotations:
+    argocd.argoproj.io/hook: PostSync
+    argocd.argoproj.io/hook-delete-policy: HookSucceeded
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: sriov-worker-labeler
+    spec:
+      restartPolicy: OnFailure
+      serviceAccountName: roce-discovery-sa
+      containers:
+        - name: labeler
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -euo pipefail
+
+              echo "=========================================="
+              echo "SR-IOV Worker Node Auto-Labeling"
+              echo "=========================================="
+              echo ""
+              echo "This job automatically labels all worker nodes with 'sriov-enabled=true'"
+              echo "to enable SR-IOV network configuration on worker nodes only."
+              echo ""
+              echo "⚠️  IMPORTANT: Master/control-plane nodes are NOT labeled automatically"
+              echo "    to prevent SR-IOV from triggering node reboots on control-plane nodes."
+              echo ""
+              echo "If you want to enable SR-IOV on master nodes (not recommended for single-master clusters),"
+              echo "manually label them with:"
+              echo "  oc label node <master-node-name> sriov-enabled=true"
+              echo ""
+              echo "=========================================="
+              echo ""
+
+              echo "Finding worker nodes..."
+              WORKER_NODES=$(oc get nodes -l node-role.kubernetes.io/worker -o jsonpath='{.items[*].metadata.name}')
+
+              if [ -z "$WORKER_NODES" ]; then
+                echo "⚠️  No worker nodes found in cluster"
+                exit 0
+              fi
+
+              echo "Found worker nodes:"
+              for node in $WORKER_NODES; do
+                echo "  - $node"
+              done
+              echo ""
+
+              echo "Labeling worker nodes with 'sriov-enabled=true'..."
+              LABELED_COUNT=0
+              for node in $WORKER_NODES; do
+                # Check if already labeled
+                if oc get node "$node" -o jsonpath='{.metadata.labels.sriov-enabled}' 2>/dev/null | grep -q "true"; then
+                  echo "  ✓ $node (already labeled)"
+                else
+                  if oc label node "$node" sriov-enabled=true; then
+                    echo "  ✓ $node (labeled)"
+                    LABELED_COUNT=$((LABELED_COUNT + 1))
+                  else
+                    echo "  ✗ $node (failed to label)"
+                  fi
+                fi
+              done
+
+              echo ""
+              echo "=========================================="
+              echo "Summary:"
+              echo "  - Worker nodes labeled: $LABELED_COUNT"
+              echo "  - Master nodes labeled: 0 (automatic labeling disabled)"
+              echo ""
+              echo "SR-IOV network policies will only apply to worker nodes."
+              echo "=========================================="
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi

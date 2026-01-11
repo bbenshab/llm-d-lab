@@ -1,0 +1,446 @@
+---
+# ArgoCD Health Monitor - Self-Healing for Stuck Operations
+# Automatically detects and clears stuck sync operations to prevent deployment hangs
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-health-monitor
+  namespace: openshift-gitops
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: argocd-health-monitor
+  namespace: openshift-gitops
+rules:
+- apiGroups: ["argoproj.io"]
+  resources: ["applications"]
+  verbs: ["get", "list", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-health-monitor-jobs
+rules:
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "list", "patch"]
+- apiGroups: ["operators.coreos.com"]
+  resources: ["clusterserviceversions", "subscriptions", "installplans"]
+  verbs: ["get", "list", "delete", "patch"]
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: argocd-health-monitor
+  namespace: openshift-gitops
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: argocd-health-monitor
+subjects:
+- kind: ServiceAccount
+  name: argocd-health-monitor
+  namespace: openshift-gitops
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-health-monitor-jobs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argocd-health-monitor-jobs
+subjects:
+- kind: ServiceAccount
+  name: argocd-health-monitor
+  namespace: openshift-gitops
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: argocd-health-monitor
+  namespace: openshift-gitops
+spec:
+  schedule: "*/2 * * * *"  # Every 2 minutes
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      ttlSecondsAfterFinished: 300
+      template:
+        spec:
+          serviceAccountName: argocd-health-monitor
+          restartPolicy: Never
+          containers:
+          - name: health-monitor
+            image: registry.redhat.io/openshift4/ose-cli:latest
+            command:
+            - /bin/bash
+            - -c
+            - |
+              set -e
+
+              echo "========================================"
+              echo "ArgoCD Health Monitor"
+              echo "Checking for stuck sync operations..."
+              echo "========================================"
+              echo ""
+
+              # Helper function to convert ISO 8601 timestamp to Unix epoch
+              # Busybox date doesn't support -d flag, so use Python instead
+              iso_to_epoch() {
+                python3 -c "import datetime; print(int(datetime.datetime.strptime('$1', '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc).timestamp()))"
+              }
+
+              # Maximum age for a sync operation before considered stuck (3 minutes)
+              MAX_AGE_SECONDS=180
+              CURRENT_TIME=$(date +%s)
+
+              stuck_count=0
+              cleared_count=0
+
+              # Get all Applications
+              apps=$(oc get application -n openshift-gitops -o name 2>/dev/null || echo "")
+
+              if [ -z "$apps" ]; then
+                echo "No Applications found. Exiting."
+                exit 0
+              fi
+
+              for app in $apps; do
+                app_name=$(echo $app | cut -d'/' -f2)
+
+                # Check if operation is running
+                operation_phase=$(oc get $app -n openshift-gitops -o jsonpath='{.status.operationState.phase}' 2>/dev/null || echo "")
+
+                if [ "$operation_phase" = "Running" ]; then
+                  # Get operation start time
+                  start_time=$(oc get $app -n openshift-gitops -o jsonpath='{.status.operationState.startedAt}' 2>/dev/null || echo "")
+
+                  if [ -n "$start_time" ]; then
+                    # Convert ISO 8601 timestamp to epoch
+                    start_epoch=$(iso_to_epoch "$start_time" 2>/dev/null || echo "0")
+                    age=$((CURRENT_TIME - start_epoch))
+
+                    if [ $age -gt $MAX_AGE_SECONDS ]; then
+                      stuck_count=$((stuck_count + 1))
+                      echo "⚠️  STUCK: $app_name - Running for ${age}s (> ${MAX_AGE_SECONDS}s)"
+                      echo "   Start time: $start_time"
+
+                      # Get operation message for logging
+                      operation_msg=$(oc get $app -n openshift-gitops -o jsonpath='{.status.operationState.message}' 2>/dev/null || echo "")
+                      if [ -n "$operation_msg" ]; then
+                        echo "   Message: $operation_msg"
+                      fi
+
+                      # Clear the stuck operation
+                      echo "   → Clearing stuck operation..."
+                      if oc patch $app -n openshift-gitops --type json -p='[{"op": "remove", "path": "/status/operationState"}]' 2>/dev/null; then
+                        cleared_count=$((cleared_count + 1))
+                        echo "   ✓ Cleared successfully"
+                      else
+                        echo "   ✗ Failed to clear (application may have been deleted)"
+                      fi
+                      echo ""
+                    else
+                      echo "✓ OK: $app_name - Running for ${age}s (< ${MAX_AGE_SECONDS}s)"
+                    fi
+                  fi
+                fi
+              done
+
+              echo ""
+              echo "========================================"
+              echo "Checking for stuck ArgoCD hook Jobs..."
+              echo "========================================"
+              echo ""
+
+              stuck_hooks=0
+              cleared_hooks=0
+
+              # Find all Jobs with ArgoCD hook annotations across all namespaces
+              hook_jobs=$(oc get jobs -A -o jsonpath='{range .items[?(@.metadata.annotations.argocd\.argoproj\.io/hook)]}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+              if [ -n "$hook_jobs" ]; then
+                for job_ref in $hook_jobs; do
+                  namespace=$(echo $job_ref | cut -d'/' -f1)
+                  job_name=$(echo $job_ref | cut -d'/' -f2)
+
+                  # Check if Job has hook finalizer
+                  has_finalizer=$(oc get job $job_name -n $namespace -o jsonpath='{.metadata.finalizers}' 2>/dev/null | grep -c "argocd.argoproj.io/hook-finalizer" || echo "0")
+
+                  if [ "$has_finalizer" -gt 0 ]; then
+                    # Check Job status and age
+                    job_status=$(oc get job $job_name -n $namespace -o jsonpath='{.status.conditions[0].type}' 2>/dev/null || echo "")
+                    deletion_timestamp=$(oc get job $job_name -n $namespace -o jsonpath='{.metadata.deletionTimestamp}' 2>/dev/null || echo "")
+                    creation_timestamp=$(oc get job $job_name -n $namespace -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || echo "")
+
+                    # If Job is terminating
+                    if [ -n "$deletion_timestamp" ]; then
+                      deletion_epoch=$(iso_to_epoch "$deletion_timestamp" 2>/dev/null || echo "0")
+                      age=$((CURRENT_TIME - deletion_epoch))
+
+                      if [ $age -gt $MAX_AGE_SECONDS ]; then
+                        stuck_hooks=$((stuck_hooks + 1))
+                        echo "⚠️  STUCK HOOK: $namespace/$job_name"
+                        echo "   Status: Terminating for ${age}s (> ${MAX_AGE_SECONDS}s)"
+                        echo "   Deletion timestamp: $deletion_timestamp"
+                        echo "   → Removing hook finalizer..."
+
+                        if oc patch job $job_name -n $namespace -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null; then
+                          cleared_hooks=$((cleared_hooks + 1))
+                          echo "   ✓ Finalizer removed"
+                        else
+                          echo "   ✗ Failed to remove finalizer"
+                        fi
+                        echo ""
+                      fi
+
+                    # If Job is completed/failed but stuck with finalizer for > 5 min
+                    elif [ "$job_status" = "Complete" ] || [ "$job_status" = "Failed" ]; then
+                      if [ -n "$creation_timestamp" ]; then
+                        creation_epoch=$(iso_to_epoch "$creation_timestamp" 2>/dev/null || echo "0")
+                        age=$((CURRENT_TIME - creation_epoch))
+
+                        if [ $age -gt $MAX_AGE_SECONDS ]; then
+                          stuck_hooks=$((stuck_hooks + 1))
+                          echo "⚠️  STUCK HOOK: $namespace/$job_name"
+                          echo "   Status: $job_status with finalizer for ${age}s (> ${MAX_AGE_SECONDS}s)"
+                          echo "   → Removing hook finalizer to allow deletion..."
+
+                          if oc patch job $job_name -n $namespace -p '{"metadata":{"finalizers":[]}}' --type=merge 2>/dev/null; then
+                            cleared_hooks=$((cleared_hooks + 1))
+                            echo "   ✓ Finalizer removed"
+                          else
+                            echo "   ✗ Failed to remove finalizer"
+                          fi
+                          echo ""
+                        fi
+                      fi
+                    fi
+                  fi
+                done
+              else
+                echo "✓ No ArgoCD hook Jobs found"
+              fi
+
+              echo ""
+              echo "========================================"
+              echo "Checking for Applications with failed PreSync hooks..."
+              echo "========================================"
+              echo ""
+
+              failed_presync=0
+              retriggered=0
+
+              # Find Applications that are Synced but have SyncFailed resources (PreSync hook failure)
+              for app in $apps; do
+                app_name=$(echo $app | cut -d'/' -f2)
+
+                # Check if app is Synced and has SyncFailed resources
+                sync_status=$(oc get $app -n openshift-gitops -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
+                has_sync_failed=$(oc get $app -n openshift-gitops -o jsonpath='{.status.resources[?(@.status=="SyncFailed")].name}' 2>/dev/null || echo "")
+
+                if [ "$sync_status" = "Synced" ] && [ -n "$has_sync_failed" ]; then
+                  failed_presync=$((failed_presync + 1))
+                  echo "⚠️  FAILED PRESYNC: $app_name has SyncFailed resources"
+                  echo "   → Retriggering sync to retry PreSync hooks..."
+
+                  if oc -n openshift-gitops patch $app --type merge -p '{"operation":{"initiatedBy":{"username":"health-monitor"},"sync":{"syncOptions":["ServerSideApply=true"],"prune":true}}}' 2>/dev/null; then
+                    retriggered=$((retriggered + 1))
+                    echo "   ✓ Sync retriggered"
+                  else
+                    echo "   ✗ Failed to retrigger sync"
+                  fi
+                  echo ""
+                fi
+              done
+
+              if [ $failed_presync -eq 0 ]; then
+                echo "✓ No failed PreSync hooks detected"
+              fi
+
+              echo ""
+              echo "========================================"
+              echo "Checking for pods stuck in Pending state..."
+              echo "========================================"
+              echo ""
+
+              stuck_pods=0
+
+              # Find pods stuck in Pending for > 3 minutes
+              pending_pods=$(oc get pods -A -o jsonpath='{range .items[?(@.status.phase=="Pending")]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' 2>/dev/null || echo "")
+
+              if [ -n "$pending_pods" ]; then
+                while IFS= read -r pod_info; do
+                  if [ -z "$pod_info" ]; then continue; fi
+
+                  pod_ref=$(echo "$pod_info" | awk '{print $1}')
+                  creation_time=$(echo "$pod_info" | awk '{print $2}')
+                  namespace=$(echo "$pod_ref" | cut -d'/' -f1)
+                  pod_name=$(echo "$pod_ref" | cut -d'/' -f2)
+
+                  creation_epoch=$(iso_to_epoch "$creation_time" 2>/dev/null || echo "0")
+                  age=$((CURRENT_TIME - creation_epoch))
+
+                  if [ $age -gt $MAX_AGE_SECONDS ]; then
+                    stuck_pods=$((stuck_pods + 1))
+
+                    # Get scheduling failure reason
+                    reason=$(oc get pod $pod_name -n $namespace -o jsonpath='{.status.conditions[?(@.type=="PodScheduled")].message}' 2>/dev/null || echo "")
+
+                    echo "⚠️  STUCK POD: $namespace/$pod_name"
+                    echo "   Age: ${age}s (> ${MAX_AGE_SECONDS}s)"
+                    if [ -n "$reason" ]; then
+                      echo "   Reason: $reason"
+                    fi
+                    echo "   ⚠ Manual intervention may be required"
+                    echo ""
+                  fi
+                done <<< "$pending_pods"
+              fi
+
+              if [ $stuck_pods -eq 0 ]; then
+                echo "✓ No pods stuck in Pending state"
+              fi
+
+              echo ""
+              echo "========================================"
+              echo "Checking for stuck OLM operators (CSVs)..."
+              echo "========================================"
+              echo ""
+
+              # Maximum age for CSV in Pending before auto-repair (5 minutes)
+              CSV_MAX_AGE_SECONDS=300
+              stuck_csvs=0
+              deleted_csvs=0
+
+              # Find all CSVs stuck in Pending phase across all namespaces
+              pending_csvs=$(oc get csv -A -o jsonpath='{range .items[?(@.status.phase=="Pending")]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{.metadata.creationTimestamp}{"\n"}{end}' 2>/dev/null || echo "")
+
+              if [ -n "$pending_csvs" ]; then
+                while IFS= read -r csv_info; do
+                  if [ -z "$csv_info" ]; then continue; fi
+
+                  csv_ref=$(echo "$csv_info" | awk '{print $1}')
+                  creation_time=$(echo "$csv_info" | awk '{print $2}')
+                  namespace=$(echo "$csv_ref" | cut -d'/' -f1)
+                  csv_name=$(echo "$csv_ref" | cut -d'/' -f2)
+
+                  creation_epoch=$(iso_to_epoch "$creation_time" 2>/dev/null || echo "0")
+                  age=$((CURRENT_TIME - creation_epoch))
+
+                  if [ $age -gt $CSV_MAX_AGE_SECONDS ]; then
+                    stuck_csvs=$((stuck_csvs + 1))
+
+                    # Get CSV status reason
+                    reason=$(oc get csv $csv_name -n $namespace -o jsonpath='{.status.conditions[?(@.phase=="Pending")].reason}' 2>/dev/null || echo "")
+                    message=$(oc get csv $csv_name -n $namespace -o jsonpath='{.status.conditions[?(@.phase=="Pending")].message}' 2>/dev/null || echo "")
+
+                    echo "⚠️  STUCK CSV: $namespace/$csv_name"
+                    echo "   Age: ${age}s (> ${CSV_MAX_AGE_SECONDS}s)"
+                    echo "   Phase: Pending"
+                    if [ -n "$reason" ]; then
+                      echo "   Reason: $reason"
+                    fi
+                    if [ -n "$message" ]; then
+                      echo "   Message: $message"
+                    fi
+                    echo "   → Deleting CSV to force OLM to retry..."
+
+                    if oc delete csv $csv_name -n $namespace --ignore-not-found=true 2>/dev/null; then
+                      deleted_csvs=$((deleted_csvs + 1))
+                      echo "   ✓ CSV deleted. OLM will recreate from Subscription."
+                    else
+                      echo "   ✗ Failed to delete CSV"
+                    fi
+                    echo ""
+                  fi
+                done <<< "$pending_csvs"
+              fi
+
+              if [ $stuck_csvs -eq 0 ]; then
+                echo "✓ No CSVs stuck in Pending state"
+              fi
+
+              echo ""
+              echo "========================================"
+              echo "Checking for broken OLM Subscriptions..."
+              echo "========================================"
+              echo ""
+
+              broken_subs=0
+              fixed_subs=0
+
+              # Find Subscriptions in UpgradePending state referencing deleted InstallPlans
+              subscriptions=$(oc get subscription -A -o jsonpath='{range .items[?(@.status.state=="UpgradePending")]}{.metadata.namespace}{"/"}{.metadata.name}{" "}{.status.installPlanRef.name}{"\n"}{end}' 2>/dev/null || echo "")
+
+              if [ -n "$subscriptions" ]; then
+                while IFS= read -r sub_info; do
+                  if [ -z "$sub_info" ]; then continue; fi
+
+                  sub_ref=$(echo "$sub_info" | awk '{print $1}')
+                  installplan_name=$(echo "$sub_info" | awk '{print $2}')
+                  namespace=$(echo "$sub_ref" | cut -d'/' -f1)
+                  sub_name=$(echo "$sub_ref" | cut -d'/' -f2)
+
+                  # Check if referenced InstallPlan exists
+                  if [ -n "$installplan_name" ]; then
+                    ip_exists=$(oc get installplan $installplan_name -n $namespace 2>/dev/null || echo "")
+
+                    if [ -z "$ip_exists" ]; then
+                      broken_subs=$((broken_subs + 1))
+
+                      echo "⚠️  BROKEN SUBSCRIPTION: $namespace/$sub_name"
+                      echo "   State: UpgradePending"
+                      echo "   References deleted InstallPlan: $installplan_name"
+                      echo "   → Deleting Subscription to force fresh OLM reconciliation..."
+
+                      if oc delete subscription $sub_name -n $namespace 2>/dev/null; then
+                        fixed_subs=$((fixed_subs + 1))
+                        echo "   ✓ Subscription deleted. ArgoCD will recreate from Application."
+                      else
+                        echo "   ✗ Failed to delete Subscription"
+                      fi
+                      echo ""
+                    fi
+                  fi
+                done <<< "$subscriptions"
+              fi
+
+              if [ $broken_subs -eq 0 ]; then
+                echo "✓ No broken Subscriptions detected"
+              fi
+
+              echo ""
+              echo "========================================"
+              echo "Summary:"
+              echo "  Stuck operations found: $stuck_count"
+              echo "  Operations cleared: $cleared_count"
+              echo "  Stuck hook Jobs found: $stuck_hooks"
+              echo "  Hook finalizers removed: $cleared_hooks"
+              echo "  Failed PreSync hooks: $failed_presync"
+              echo "  Syncs retriggered: $retriggered"
+              echo "  Pods stuck in Pending: $stuck_pods"
+              echo "  CSVs stuck in Pending: $stuck_csvs"
+              echo "  CSVs deleted: $deleted_csvs"
+              echo "  Broken Subscriptions: $broken_subs"
+              echo "  Subscriptions fixed: $fixed_subs"
+              echo "========================================"
+
+              total_issues=$((stuck_count + stuck_hooks + failed_presync + stuck_pods + stuck_csvs + broken_subs))
+
+              if [ $total_issues -gt 0 ]; then
+                echo ""
+                echo "✓ Self-healing completed. ArgoCD automated sync will retry."
+              else
+                echo ""
+                echo "✓ All operations, hooks, and pods healthy. No intervention needed."
+              fi

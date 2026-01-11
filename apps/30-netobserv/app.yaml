@@ -2,6 +2,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: netobserv
+  namespace: openshift-gitops
   labels:
     app.kubernetes.io/managed-by: llm-d-lab
 spec:

@@ -1,6 +1,7 @@
 kind: Kustomization
 apiVersion: kustomize.config.k8s.io/v1beta1
 resources:
+- ./patch-operator-scheduling.yaml
 - ./sriovoperatorconfig.yaml
 - ./sriovnetworknodepolicy.yaml
 #- ./sriovnetwork.yaml

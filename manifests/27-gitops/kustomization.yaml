@@ -3,3 +3,5 @@ kind: Kustomization
 resources:
 - ./appproject.yaml
 - ./gitopsservice.yaml
+# Note: argocd-health-monitor.yaml is deployed in 00-prerequisites.yaml
+# to ensure it's running BEFORE root-app deploys (prevents chicken-and-egg issues)

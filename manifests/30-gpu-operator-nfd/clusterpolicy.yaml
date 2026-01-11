@@ -2,47 +2,95 @@ apiVersion: nvidia.com/v1
 kind: ClusterPolicy
 metadata:
   name: gpu-cluster-policy
+  namespace: nvidia-gpu-operator
 spec:
-  daemonsets:
-    rollingUpdate:
-      maxUnavailable: "1"
-    updateStrategy: RollingUpdate
-    # TODO: NOTE: REMEMBER: these tolerations come from 01-infra-ocp/templates/machinesets.yaml
-    tolerations:
-      - key: "benchmark.llm-d.ai/test-gpu-amd64"
-        operator: "Exists"
-        effect: "NoSchedule"
+  # --- General Operator Settings ---
+  operator:
+    defaultRuntime: crio
+    initContainer: {}
+    runtimeClass: nvidia
+    use_ocp_driver_toolkit: true
+  # --- Driver & Licensing ---
+  # Note: Driver pod scheduling is controlled by nvidia.com/gpu.deploy.driver=true/false label
+  # Node prep Job sets this to 'false' on master/control-plane nodes
+  driver:
+    enabled: true
+    kernelModuleType: auto
+    certConfig:
+      name: ''
+    rdma:
+      enabled: true      # Enables nvidia-peermem
+      useHostMofed: false # Requires Network Operator
+    useNvidiaDriverCRD: false
+    kernelModuleConfig:
+      name: 'kernel-module-params'
+    # MATCHES PHASE 1.3
+    usePrecompiled: false
+    repoConfig:
+      configMapName: ''
+    upgradePolicy:
+      autoUpgrade: true
+      maxParallelUpgrades: 1
+      maxUnavailable: 25%
+      drain:
+        deleteEmptyDir: false
+        enable: false
+        force: false
+        timeoutSeconds: 300
+      podDeletion:
+        deleteEmptyDir: false
+        force: false
+        timeoutSeconds: 300
+      waitForCompletion:
+        timeoutSeconds: 0
+  # --- Monitoring ---
   dcgm:
     enabled: true
   dcgmExporter:
     enabled: true
     serviceMonitor:
       enabled: true
-  devicePlugin:
-    enabled: true
-  driver:
-    enabled: true
-    kernelModuleConfig:
-      name: kernel-module-params    # Reference the ConfigMap created above
-    rdma:
-      enabled: true                  # CRITICAL: Enable RDMA support
-      useHostMofed: false
-    upgradePolicy:
-      autoUpgrade: true
-  gdrcopy:
-    enabled: true
-  gfd:
-    enabled: true
-  migManager:
-    enabled: true
   nodeStatusExporter:
     enabled: true
-  operator:
-    defaultRuntime: crio
-    runtimeClass: nvidia
-    use_ocp_driver_toolkit: true
+  # --- Device Plugins & Topology ---
+  devicePlugin:
+    enabled: true
+    config:
+      default: ''
+      name: ''
+  sandboxDevicePlugin:
+    enabled: true
+  # --- Advanced Features (MIG, RDMA, GDR) ---
+  mig:
+    strategy: none
+  migManager:
+    enabled: false
+  vgpuDeviceManager:
+    enabled: true
+  gdrcopy:
+    enabled: true
+  # Requires nvidia-peermem (enabled via rdma: true above)
+  gfd:
+    enabled: true
+  vfioManager:
+    enabled: true
+  # --- Toolkit ---
   toolkit:
     enabled: true
     installDir: /usr/local/nvidia
-  vfioManager:
-    enabled: true
+  # --- Updates & Validation ---
+  daemonsets:
+    rollingUpdate:
+      maxUnavailable: '1'
+    updateStrategy: RollingUpdate
+  validator:
+    plugin:
+      env: []
+  # --- Disabled Components ---
+  sandboxWorkloads:
+    defaultWorkload: container
+    enabled: false
+  gds:
+    enabled: false
+  vgpuManager:
+    enabled: false

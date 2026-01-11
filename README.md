@@ -76,6 +76,117 @@ To be tested and documented.
 
 ---
 
+## 🔄 Self-Healing & Automation
+
+The deployment includes **automated self-healing** via an ArgoCD health monitor that runs every 2 minutes to detect and fix common GitOps deployment issues:
+
+### What It Fixes Automatically
+
+1. **Stuck ArgoCD Sync Operations** (>3 minutes)
+   - Clears operations waiting for deleted resources
+   - Unblocks wave-based deployments from progressing
+
+2. **Stuck ArgoCD Hook Jobs**
+   - Removes finalizers from PreSync/PostSync Jobs stuck in Terminating state
+   - Prevents namespace deletion hangs
+
+3. **Failed PreSync Hook Detection**
+   - Detects Applications with SyncFailed resources
+   - Automatically retriggers sync to retry failed hooks
+   - **Example:** NVIDIA Network Operator's version discovery Job
+
+4. **Stuck Pod Detection**
+   - Monitors pods in Pending state for >3 minutes
+   - Logs scheduling failure reasons for investigation
+   - Alerts for manual intervention when needed
+
+### How It Works
+
+- **CronJob:** Runs every 2 minutes in `openshift-gitops` namespace
+- **Proactive:** Detects issues before they block deployments
+- **Transparent:** All actions logged in Job output
+- **Safe:** Only clears stuck states, doesn't modify resources
+
+### Viewing Health Monitor Logs
+
+```bash
+# See latest health check
+oc logs -n openshift-gitops job/argocd-health-monitor-<latest> --tail=100
+
+# Watch CronJob schedule
+oc get cronjob argocd-health-monitor -n openshift-gitops
+```
+
+**Location:** `manifests/27-gitops/argocd-health-monitor.yaml`
+
+---
+
+## 🔧 Troubleshooting
+
+### OLM CSV Stuck in Pending State
+
+**Symptom:** After cleanup or fresh deployment, operator ClusterServiceVersion (CSV) remains in `Pending` phase for several minutes with status `RequirementsNotMet`.
+
+**Example:**
+```bash
+oc get csv -n openshift-operators
+# NAME                                DISPLAY                  VERSION   REPLACES   PHASE
+# openshift-gitops-operator.v1.19.0   Red Hat OpenShift GitOps 1.19.0              Pending
+```
+
+**Root Cause:** This occurs when OLM recreates a CSV before its required CRDs are fully deleted from the cluster. The timing issue typically happens during cleanup when:
+1. Cleanup Job deletes operator Subscription → OLM starts CSV cleanup
+2. OLM has already recreated the CSV
+3. Cleanup Job deletes CRDs 10 seconds later
+4. CSV is now stuck waiting for CRDs that won't be created because InstallPlan already shows "Complete"
+
+**Diagnostic Commands:**
+
+```bash
+# 1. Check CSV status
+oc get csv <csv-name> -n <namespace> -o jsonpath='{.status.phase}'
+# Output: Pending
+
+# 2. Check detailed CSV conditions
+oc describe csv <csv-name> -n <namespace>
+# Look for:
+#   Message: one or more requirements couldn't be found
+#   Reason: RequirementsNotMet
+
+# 3. Check missing CRDs
+oc get csv <csv-name> -n <namespace> -o yaml | grep -A 30 "status:"
+# Look for CRDs with status: NotPresent
+
+# 4. Check InstallPlan status
+oc get installplan -n <namespace>
+# If InstallPlan shows "Complete" but CRDs are missing, CSV is stuck
+
+# Example for ArgoCD operator:
+oc get csv openshift-gitops-operator.v1.19.0 -n openshift-operators -o jsonpath='{.status.phase}'
+oc describe csv openshift-gitops-operator.v1.19.0 -n openshift-operators
+oc get installplan -n openshift-operators
+```
+
+**Resolution:**
+
+Delete the stuck CSV to force OLM to start fresh with a new InstallPlan:
+
+```bash
+# Delete the stuck CSV
+oc delete csv <csv-name> -n <namespace>
+
+# Example for ArgoCD operator:
+oc delete csv openshift-gitops-operator.v1.19.0 -n openshift-operators
+
+# Wait 30-60 seconds, then verify:
+oc get csv -n <namespace>
+# Phase should progress: Installing → Succeeded
+```
+
+**Prevention:** The auto-approval Job (`overlays/<env>/00-prerequisites.yaml`) includes retry logic to handle this automatically during initial deployment. For manual cleanup scenarios, ensure sufficient time between CSV and CRD deletion steps.
+
+---
+
 ## 🏃 Running Example Workloads
 
 The `examples/` directory contains sample manifests and Helm charts intended for deploying LLM-D workloads.

@@ -2,6 +2,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: multiarch-tuning-operator
+  namespace: openshift-gitops
   labels:
     app.kubernetes.io/managed-by: llm-d-lab
 spec:
